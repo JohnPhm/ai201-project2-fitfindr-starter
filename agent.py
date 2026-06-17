@@ -18,7 +18,43 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from a natural language query.
+
+    Uses regex heuristics rather than an LLM call, since the inputs are short
+    and the patterns (a dollar price, a "size X" token) are predictable.
+    """
+    working = query
+
+    # Extract max_price: matches "$30", "under 30", "under $30 dollars"
+    max_price = None
+    price_match = re.search(r"\$?(\d+(?:\.\d+)?)", query)
+    if price_match and (
+        "$" in query or "under" in query.lower() or "less than" in query.lower()
+    ):
+        max_price = float(price_match.group(1))
+        working = working.replace(price_match.group(0), "")
+
+    # Extract size: looks for "size X" (e.g. "size M", "size S/M")
+    size = None
+    size_match = re.search(r"size\s+([A-Za-z0-9/]+)", query, re.IGNORECASE)
+    if size_match:
+        size = size_match.group(1)
+        working = working.replace(size_match.group(0), "")
+
+    # Strip filler words left over from price/size extraction
+    working = re.sub(r"\b(under|less than|dollars?)\b", "", working, flags=re.IGNORECASE)
+    description = re.sub(r"\s+", " ", working).strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -51,50 +87,47 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     """
     Main agent entry point. Runs the FitFindr planning loop for a single
     user interaction and returns the completed session dict.
-
-    Args:
-        query:    Natural language user request
-                  (e.g., "vintage graphic tee under $30, size M")
-        wardrobe: User's wardrobe dict — use get_example_wardrobe() or
-                  get_empty_wardrobe() from utils/data_loader.py
-
-    Returns:
-        The session dict after the interaction completes. Check session["error"]
-        first — if it is not None, the interaction ended early and the other
-        output fields (outfit_suggestion, fit_card) will be None.
-
-    TODO — implement this function using the planning loop you designed in planning.md:
-
-        Step 1: Initialize the session with _new_session().
-
-        Step 2: Parse the user's query to extract a description, size, and
-                max_price. You can use regex, string splitting, or ask the LLM
-                to parse it — document your choice in planning.md.
-                Store the result in session["parsed"].
-
-        Step 3: Call search_listings() with the parsed parameters.
-                Store results in session["search_results"].
-                If no results: set session["error"] to a helpful message and
-                return the session early. Do NOT proceed to suggest_outfit
-                with empty input.
-
-        Step 4: Select the item to use (e.g., the top result).
-                Store it in session["selected_item"].
-
-        Step 5: Call suggest_outfit() with the selected item and wardrobe.
-                Store the result in session["outfit_suggestion"].
-
-        Step 6: Call create_fit_card() with the outfit suggestion and selected item.
-                Store the result in session["fit_card"].
-
-        Step 7: Return the session.
-
-    Before writing code, complete the Planning Loop and State Management sections
-    of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1 — Initialize the session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2 — Parse the query into description / size / max_price
+    session["parsed"] = _parse_query(query)
+
+    # Step 3 — Call search_listings(); branch early on no results or load failure
+    try:
+        session["search_results"] = search_listings(
+            description=session["parsed"]["description"],
+            size=session["parsed"]["size"],
+            max_price=session["parsed"]["max_price"],
+        )
+    except (FileNotFoundError, ValueError) as e:
+        session["error"] = f"Could not load listings data: {e}"
+        return session
+
+    if not session["search_results"]:
+        session["error"] = (
+            f"No listings found matching '{query}'. "
+            "Try a broader description, a higher price limit, or a different size."
+        )
+        return session  # Early return — do NOT call suggest_outfit or create_fit_card
+
+    # Step 4 — Select the top result
+    session["selected_item"] = session["search_results"][0]
+
+    # Step 5 — Suggest an outfit using the selected item + wardrobe
+    session["outfit_suggestion"] = suggest_outfit(
+        new_item=session["selected_item"],
+        wardrobe=session["wardrobe"],
+    )
+
+    # Step 6 — Generate the shareable fit card caption
+    session["fit_card"] = create_fit_card(
+        outfit=session["outfit_suggestion"],
+        new_item=session["selected_item"],
+    )
+
+    # Step 7 — Return the completed session
     return session
 
 
